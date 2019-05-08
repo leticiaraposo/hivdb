@@ -1,0 +1,162 @@
+# Downloading the data
+# install.packages("data.table") 
+library(data.table)
+data <-
+  fread(
+    'https://raw.githubusercontent.com/leticiaraposo/hivdb/master/data.txt',
+    stringsAsFactors = T
+  )
+data <- as.data.frame(data) 
+ 
+# Selecting the columns with information about ID, subtype, LPV fold and 99 amino acid positions
+dataLPV1 <- data[, c("SeqID", "SubType", "LPV Fold")]
+dataLPV2 <- data[, 24:122] #positions
+
+# Converting the "-" symbol to the original amino acids from HIV-1 subtype B protease sequence
+protease <- 'PQITLWQRPLVTIKIGGQLKEALLDTGADDTVLEEMNLPGRWKPKMIGGIGGFIKVRQYDQILIEICGHKAIGTVLVGPTPVNIIGRNLLTQIGCTLNF'
+protease <- strsplit(protease, split = "")[[1]]
+ 
+dataLPV2[] <- lapply(dataLPV2, function(x) levels(x)[x])
+w <- which(dataLPV2 == "-", arr.ind = TRUE)
+dataLPV2[w] <- protease[w[, "col"]]
+
+# Grouping the data
+dataLPV <- cbind(dataLPV1, dataLPV2)
+
+# Filtering only HIV-1 subtype B
+dataLPV <- dataLPV[dataLPV$SubType == "B",]
+ 
+# Removing observations that do not have LPV Fold value
+colnames(dataLPV)[3] <- "LPVFold"
+dataLPV <- dataLPV[!is.na(dataLPV$LPVFold),]
+
+# Removing deletions (~), insertions (#), stop codons (*), amino acid mixture with more than 4 amino acids (X) and unknown amino acid (.)
+index <-
+   dataLPV[rowSums(dataLPV[-c(1:3)] == "~" |
+                     dataLPV[-c(1:3)] == "#" |
+                     dataLPV[-c(1:3)] == "*" |
+                     dataLPV[-c(1:3)] == "X" | 
+                     dataLPV[-c(1:3)] == ".") != 0, 'SeqID']
+dataLPV <- dataLPV[!dataLPV$SeqID %in% index,]
+ 
+# Identifying rows with amino acid mixtures
+mix <- NULL
+for (j in 1:dim(dataLPV)[1]) {
+   if (length(unlist(strsplit(as.matrix(dataLPV[j, 4:102]), split = ""))) > 99) {
+     mix <- c(mix, j)
+   }
+ }
+dataLPV <- dataLPV[-mix,]
+ 
+# Removing duplicated sequences
+dataLPV <- dataLPV[!duplicated(dataLPV[, 4:102]),]
+dim(dataLPV)
+
+# Encoding the variable response (0 - nonresistant to LPV; 1 - resistant to LPV)
+dataLPV$LPVFold <- ifelse (dataLPV$LPVFold < 9, 0, 1)
+table(dataLPV$LPVFold)
+
+# Encoding the amino acids with the hydrophobicity scale of Kyte-Doolittle
+# install.packages("Peptides")
+library(Peptides)
+dataLPV2 <-
+   as.data.frame(matrix(NA, nrow = dim(dataLPV)[1], ncol = 99))
+for (k in 1:dim(dataLPV2)[1]) {
+  for (l in 1:dim(dataLPV2)[2]) {
+    dataLPV2[k, l] <-
+      hydrophobicity(dataLPV[k, l + 3], scale = "KyteDoolittle")
+  }
+}
+dataLPV2 <- cbind(dataLPV2, as.factor(dataLPV$LPVFold))
+row.names(dataLPV2) <- dataLPV[, 1]
+colnames(dataLPV2)[dim(dataLPV2)[2]] <- "output"
+ 
+# Removing zero and near-zero variance predictors
+# install.packages("caret")
+library(caret)
+x <- nearZeroVar(dataLPV2, saveMetrics = T)
+dataLPV2 <- dataLPV2[,!x$nzv]
+dim(dataLPV2) # 30 variable predictors and 1 response variable
+
+# Setting training and test set
+set.seed(123)
+smp_size <- floor(0.70 * nrow(dataLPV2))
+train_ind <- sample(seq_len(nrow(dataLPV2)), size = smp_size)
+train <- dataLPV2[train_ind,]
+test <- dataLPV2[-train_ind,]
+table(train$output)
+table(test$output)
+
+# Random forest
+library(randomForest)
+set.seed(123)
+LPV.rf <- randomForest(output ~ ., data = train,
+                       importance = T)
+print(LPV.rf)
+
+# Variable importance - random forest
+imp <- as.data.frame(LPV.rf$importance[, 3])
+imp$varnames <- gsub("V", "P", rownames(imp))
+colnames(imp)[1] <- "MeanDecreaseAccuracy"
+rownames(imp) <- NULL
+MDA <- imp[order(imp$MeanDecreaseAccuracy, decreasing = T), ]
+MDA <- MDA[1:10, ]
+ggplot(MDA, aes(x = reorder(varnames, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_point() +
+  geom_segment(aes(x = varnames, xend = varnames, y = 0, yend = MeanDecreaseAccuracy)) +
+  ylab("Mean Decrease Accuracy") +
+  xlab("Positions") +
+  coord_flip()
+
+# Classification tree
+# install.packages("rpart")
+library(rpart)
+set.seed(123)
+LPV.tree <- rpart(output ~ ., data = train, method = "class")
+
+# Variable importance – classification tree
+imp.tree <- as.data.frame(varImp(LPV.tree))
+imp.tree <- data.frame(overall = imp.tree$Overall,
+                       names   = rownames(imp.tree))
+imp.tree <- imp.tree[order(imp.tree$overall,decreasing = T),] 
+imp.tree10 <- imp.tree[1:10, ]
+
+# Logistic regression 
+set.seed(123)
+LPV.logr <- glm(output ~ ., data = train, family = binomial(link='logit'))
+LPV.logr2 <- step(LPV.logr)
+summary(LPV.logr2)
+
+# Variable importance – logistic regression
+imp.log <- as.data.frame(varImp(LPV.logr2))
+imp.log <- data.frame(overall = imp.log$Overall,
+                      names   = rownames(imp.log))
+imp.log <- imp.log[order(imp.log$overall,decreasing = T),]
+imp.log10 <- imp.log[1:10,]
+
+# Prediction and performance - random forest
+# install.packages("pROC")
+library(pROC)
+pred.rf <- predict(LPV.rf, test[,-dim(test)[2]], type = "class")
+pred.rf2 <- predict(LPV.rf, test[,-dim(test)[2]], type = "prob")
+confusionMatrix(pred.rf, test$output, positive = "1")                                       
+roc.rf <- roc(test$output, pred.rf2[,2], percent = F)
+ci.auc(roc.rf)
+ci.thresholds(roc.rf, thresholds = 0.5)
+
+# Prediction and performance - classification tree
+pred.tree <- predict(LPV.tree, test[,-dim(test)[2]], type = "class")
+pred.tree2 <- predict(LPV.tree, test[,-dim(test)[2]], type = "prob")
+confusionMatrix(pred.tree, test$output, positive = "1")
+roc.tree <- roc(test$output, pred.tree2[,2], percent = F)
+ci.auc(roc.tree)
+ci.thresholds(roc.tree, thresholds = 0.5)
+
+# Prediction and performance - logistic regression
+pred.logr <- predict(LPV.logr2, test[,-dim(test)[2]], type = "response")
+pred.logr2 <- as.factor(ifelse(pred.logr > 0.5, 1, 0))
+confusionMatrix(pred.logr2, test$output, positive = "1")                                     
+roc.logr <- roc(test$output, pred.logr, percent = F)
+ci.auc(roc.logr)
+ci.thresholds(roc.logr, thresholds = 0.5)
+
